@@ -36,6 +36,7 @@ class AzureVM(VMInterface):
         *args,
         location: str = None,
         vnet: str = None,
+        subnet: str = None,
         public_ingress: bool = None,
         security_group: str = None,
         vm_size: str = None,
@@ -48,6 +49,7 @@ class AzureVM(VMInterface):
         extra_bootstrap=None,
         auto_shutdown: bool = None,
         marketplace_plan: dict = {},
+        extra_vm_options: Optional[dict] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -60,6 +62,8 @@ class AzureVM(VMInterface):
         self.extra_bootstrap = extra_bootstrap
         self.admin_username = "dask"
         self.admin_password = str(uuid.uuid4())[:32]
+        self.vnet = vnet
+        self.subnet = subnet
         self.security_group = security_group
         self.nic_name = f"dask-cloudprovider-nic-{str(uuid.uuid4())[:8]}"
         self.docker_image = docker_image
@@ -71,20 +75,23 @@ class AzureVM(VMInterface):
         self.auto_shutdown = auto_shutdown
         self.env_vars = env_vars
         self.marketplace_plan = marketplace_plan
+        self.extra_vm_options = extra_vm_options or {}
 
     async def create_vm(self):
-        [subnet_info, *_] = await self.cluster.call_async(
-            self.cluster.network_client.subnets.list,
-            self.cluster.resource_group,
-            self.cluster.vnet,
-        )
+        if not self.subnet:
+            [subnet_info, *_] = await self.cluster.call_async(
+                self.cluster.network_client.subnets.list,
+                self.cluster.resource_group,
+                self.vnet,
+            )
+            self.subnet = subnet_info.id
 
         nic_parameters = {
             "location": self.location,
             "ip_configurations": [
                 {
                     "name": self.nic_name,
-                    "subnet": {"id": subnet_info.id},
+                    "subnet": {"id": self.subnet},
                 }
             ],
             "networkSecurityGroup": {
@@ -179,6 +186,13 @@ class AzureVM(VMInterface):
             vm_parameters["storage_profile"]["image_reference"]["version"] = "latest"
             self.cluster._log("Using Marketplace VM image with a Plan")
 
+        repeated = self.extra_vm_options.keys() & vm_parameters.keys()
+        if repeated:
+            raise TypeError(
+                f"Parameters are passed in both 'extra_vm_options' and as regular parameters: {repeated}"
+            )
+        vm_parameters = {**self.extra_vm_options, **vm_parameters}
+
         self.cluster._log("Creating VM")
         if self.cluster.debug:
             self.cluster._log(
@@ -267,6 +281,9 @@ class AzureVMCluster(VMCluster):
         The resource group to create components in. List your resource groups with ``az group list``.
     vnet: str
         The vnet to attach VM network interfaces to. List your vnets with ``az network vnet list``.
+    subnet: str (optional)
+        The vnet subnet to attach VM network interfaces to.
+        If omitted it will automatically use the first subnet in your vnet.
     security_group: str
         The security group to apply to your VMs.
         This must allow ports 8786-8787 from wherever you are running this from.
@@ -344,6 +361,9 @@ class AzureVMCluster(VMCluster):
         The ID of the Azure Subscription to create the virtual machines in. If not specified, then
         dask-cloudprovider will attempt to use the configured default for the Azure CLI. List your
         subscriptions with ``az account list``.
+    extra_vm_options: dict[str, Any]:
+        Additional arguments to provide to Azure's ``VirtualMachinesOperations.begin_create_or_update``
+        when creating the scheduler and worker VMs.
 
     Examples
     --------
@@ -433,7 +453,7 @@ class AzureVMCluster(VMCluster):
     ...                          security_group="<security group>",
     ...                          n_workers=1,
     ...                          vm_size="Standard_NC12s_v3",  # Or any NVIDIA GPU enabled size
-    ...                          docker_image="rapidsai/rapidsai:cuda11.0-runtime-ubuntu18.04-py3.8",
+    ...                          docker_image="rapidsai/rapidsai:cuda11.0-runtime-ubuntu18.04-py3.9",
     ...                          worker_class="dask_cuda.CUDAWorker")
     >>> from dask.distributed import Client
     >>> client = Client(cluster)
@@ -460,6 +480,7 @@ class AzureVMCluster(VMCluster):
         location: str = None,
         resource_group: str = None,
         vnet: str = None,
+        subnet: str = None,
         security_group: str = None,
         public_ingress: bool = None,
         vm_size: str = None,
@@ -472,6 +493,7 @@ class AzureVMCluster(VMCluster):
         debug: bool = False,
         marketplace_plan: dict = {},
         subscription_id: Optional[str] = None,
+        extra_vm_options: Optional[dict] = None,
         **kwargs,
     ):
         self.config = ClusterConfig(dask.config.get("cloudprovider.azure", {}))
@@ -505,6 +527,7 @@ class AzureVMCluster(VMCluster):
         self.vnet = self.config.get("azurevm.vnet", override_with=vnet)
         if self.vnet is None:
             raise ConfigError("You must configure a vnet")
+        self.subnet = self.config.get("azurevm.subnet", override_with=subnet)
         self.security_group = self.config.get(
             "azurevm.security_group", override_with=security_group
         )
@@ -550,10 +573,14 @@ class AzureVMCluster(VMCluster):
                     """To create a virtual machine from Marketplace image or a custom image sourced
                 from a Marketplace image with a plan, all 3 fields 'name', 'publisher' and 'product' must be passed."""
                 )
-
+        self.extra_vm_options = extra_vm_options or self.config.get(
+            "azurevm.extra_vm_options"
+        )
         self.options = {
             "cluster": self,
             "config": self.config,
+            "subnet": self.subnet,
+            "vnet": self.vnet,
             "security_group": self.security_group,
             "location": self.location,
             "vm_image": self.vm_image,
@@ -563,6 +590,7 @@ class AzureVMCluster(VMCluster):
             "auto_shutdown": self.auto_shutdown,
             "docker_image": self.docker_image,
             "marketplace_plan": self.marketplace_plan,
+            "extra_vm_options": self.extra_vm_options,
         }
         self.scheduler_options = {
             "vm_size": self.scheduler_vm_size,

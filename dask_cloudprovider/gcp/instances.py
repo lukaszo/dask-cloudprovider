@@ -1,12 +1,10 @@
 import asyncio
-import os
 import uuid
 import json
 
-import sqlite3
+from typing import Optional, Any, Dict
 
 import dask
-from dask.utils import tmpfile
 from dask_cloudprovider.generic.vmcluster import (
     VMCluster,
     VMInterface,
@@ -106,11 +104,9 @@ class GCPInstance(VMInterface):
         self.instance_labels = _instance_labels
 
         self.general_zone = "-".join(self.zone.split("-")[:2])  # us-east1-c -> us-east1
-
         self.service_account = service_account or self.config.get("service_account")
 
     def create_gcp_config(self):
-
         subnetwork = f"projects/{self.network_projectid}/regions/{self.general_zone}/subnetworks/{self.network}"
         config = {
             "name": self.name,
@@ -205,7 +201,6 @@ class GCPInstance(VMInterface):
         return config
 
     async def create_vm(self):
-
         self.cloud_init = self.cluster.render_process_cloud_init(self)
 
         self.gcp_config = self.create_gcp_config()
@@ -440,7 +435,7 @@ class GCPCluster(VMCluster):
 
         This image must have a valid Python environment and have ``dask`` installed in order for the
         ``dask-scheduler`` and ``dask-worker`` commands to be available. It is recommended the Python
-        environment matches your local environment where ``EC2Cluster`` is being created from.
+        environment matches your local environment where ``GCPCluster`` is being created from.
 
         For GPU instance types the Docker image much have NVIDIA drivers and ``dask-cuda`` installed.
 
@@ -496,6 +491,8 @@ class GCPCluster(VMCluster):
     service_account: str
         Service account that all VMs will run under.
         Defaults to the default Compute Engine service account for your GCP project.
+    service_account_credentials: Optional[Dict[str, Any]]
+        Service account credentials to create the compute engine Vms
 
     Examples
     --------
@@ -589,10 +586,10 @@ class GCPCluster(VMCluster):
         debug=False,
         instance_labels=None,
         service_account=None,
+        service_account_credentials: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
-
-        self.compute = GCPCompute()
+        self.compute = GCPCompute(service_account_credentials)
 
         self.config = dask.config.get("cloudprovider.gcp", {})
         self.auto_shutdown = (
@@ -628,9 +625,11 @@ class GCPCluster(VMCluster):
             "gpu_instance": self.gpu_instance,
             "bootstrap": self.bootstrap,
             "auto_shutdown": self.auto_shutdown,
-            "preemptible": preemptible
-            if preemptible is not None
-            else self.config.get("preemptible"),
+            "preemptible": (
+                preemptible
+                if preemptible is not None
+                else self.config.get("preemptible")
+            ),
             "instance_labels": instance_labels or self.config.get("instance_labels"),
             "service_account": service_account or self.config.get("service_account"),
         }
@@ -644,37 +643,44 @@ class GCPCluster(VMCluster):
 
 
 class GCPCompute:
-    """Wrapper for the ``googleapiclient`` compute object."""
+    """
+    Wrapper for the ``googleapiclient`` compute object.
 
-    def __init__(self):
+    Attributes
+    ----------
+    service_account_credentials: Optional[dict]
+        Service account credentials to create the compute engine Vms
+    """
+
+    def __init__(self, service_account_credentials: Optional[dict[str, Any]] = None):
+        self.service_account_credentials = service_account_credentials or {}
         self._compute = self.refresh_client()
 
     def refresh_client(self):
-
-        if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", False):
+        if self.service_account_credentials:
             import google.oauth2.service_account  # google-auth
 
-            creds = google.oauth2.service_account.Credentials.from_service_account_file(
-                os.environ["GOOGLE_APPLICATION_CREDENTIALS"],
-                scopes=["https://www.googleapis.com/auth/cloud-platform"],
+            credentials = (
+                google.oauth2.service_account.Credentials.from_service_account_info(
+                    self.service_account_credentials,
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"],
+                )
             )
         else:
-            import google.auth.credentials  # google-auth
+            import google.auth
 
-            path = os.path.join(
-                os.path.expanduser("~"), ".config/gcloud/credentials.db"
-            )
-            if not os.path.exists(path):
-                raise GCPCredentialsError()
-            conn = sqlite3.connect(path)
-            creds_rows = conn.execute("select * from credentials").fetchall()
-            with tmpfile() as f:
-                with open(f, "w") as f_:
-                    # take first row
-                    f_.write(creds_rows[0][1])
-                creds, _ = google.auth.load_credentials_from_file(filename=f)
+            # Obtain Application Default Credentials (ADC)
+            try:
+                credentials, _ = google.auth.default()
+            except google.auth.exceptions.DefaultCredentialsError as e:
+                raise GCPCredentialsError() from e
+
+        # Use the credentials to build a service client
         return googleapiclient.discovery.build(
-            "compute", "v1", credentials=creds, requestBuilder=build_request(creds)
+            "compute",
+            "v1",
+            credentials=credentials,
+            requestBuilder=build_request(credentials),
         )
 
     def instances(self):
